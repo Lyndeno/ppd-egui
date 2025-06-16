@@ -54,29 +54,36 @@ fn main() -> eframe::Result {
         .map(|p| p.profile.into())
         .collect();
 
+    let _ = conn.close();
+
     let (ui_sender, ui_receiver) = async_channel::unbounded::<Profile>();
     let (task_sender, task_receiver) = async_channel::unbounded();
     let (repaint_sender, repaint_receiver) = async_channel::unbounded();
 
-    let _setter_task = crate::runtime().spawn(async move {
+    let _task_setup = crate::runtime().spawn(async move {
         let conn = zbus::Connection::system().await.unwrap();
-        let proxy = PpdProxy::new(&conn).await.unwrap();
-        while let Ok(v) = ui_receiver.recv().await {
-            proxy.set_active_profile(v.to_string()).await.unwrap()
-        }
-    });
+        let setter_proxy = PpdProxy::new(&conn).await.unwrap();
+        let signal_proxy = setter_proxy.clone();
 
-    let _signal_task = crate::runtime().spawn(async move {
-        let conn = zbus::Connection::system().await.unwrap();
-        let proxy = PpdProxy::new(&conn).await.unwrap();
-        let rp: Context = repaint_receiver.recv().await.unwrap();
-        repaint_receiver.close();
-        let mut signal = proxy.receive_active_profile_changed().await;
-        while let Some(p) = signal.next().await {
-            let profile: Profile = p.get().await.unwrap().into();
-            task_sender.send(profile).await.unwrap();
-            rp.request_repaint();
-        }
+        let _setter_task = crate::runtime().spawn(async move {
+            while let Ok(v) = ui_receiver.recv().await {
+                setter_proxy
+                    .set_active_profile(v.to_string())
+                    .await
+                    .unwrap()
+            }
+        });
+
+        let _signal_task = crate::runtime().spawn(async move {
+            let rp: Context = repaint_receiver.recv().await.unwrap();
+            repaint_receiver.close();
+            let mut signal = signal_proxy.receive_active_profile_changed().await;
+            while let Some(p) = signal.next().await {
+                let profile: Profile = p.get().await.unwrap().into();
+                task_sender.send(profile).await.unwrap();
+                rp.request_repaint();
+            }
+        });
     });
 
     let options = eframe::NativeOptions {
