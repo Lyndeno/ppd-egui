@@ -1,5 +1,5 @@
 use async_channel::TryRecvError;
-use eframe::egui;
+use eframe::egui::{self, Context};
 use futures::StreamExt;
 use ppd::{PpdProxy, PpdProxyBlocking};
 use std::sync::OnceLock;
@@ -56,8 +56,9 @@ fn main() -> eframe::Result {
 
     let (ui_sender, ui_receiver) = async_channel::unbounded::<Profile>();
     let (task_sender, task_receiver) = async_channel::unbounded();
+    let (repaint_sender, repaint_receiver) = async_channel::unbounded();
 
-    let background = crate::runtime().spawn(async move {
+    let _setter_task = crate::runtime().spawn(async move {
         let conn = zbus::Connection::system().await.unwrap();
         let proxy = PpdProxy::new(&conn).await.unwrap();
         while let Ok(v) = ui_receiver.recv().await {
@@ -65,13 +66,16 @@ fn main() -> eframe::Result {
         }
     });
 
-    let background_2 = crate::runtime().spawn(async move {
+    let _signal_task = crate::runtime().spawn(async move {
         let conn = zbus::Connection::system().await.unwrap();
         let proxy = PpdProxy::new(&conn).await.unwrap();
+        let rp: Context = repaint_receiver.recv().await.unwrap();
+        repaint_receiver.close();
         let mut signal = proxy.receive_active_profile_changed().await;
         while let Some(p) = signal.next().await {
             let profile: Profile = p.get().await.unwrap().into();
             task_sender.send(profile).await.unwrap();
+            rp.request_repaint();
         }
     });
 
@@ -85,10 +89,14 @@ fn main() -> eframe::Result {
     // Our application state:
     let mut current = proxy.active_profile().unwrap().into();
 
-    eframe::run_simple_native("My egui App", options, move |ctx, _frame| {
+    eframe::run_simple_native("ppd-egui", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("My egui Application");
+            ui.heading("System Power");
             ui.label("Power Profiles");
+
+            if !repaint_sender.is_closed() {
+                let _ = repaint_sender.try_send(ctx.clone());
+            }
 
             match task_receiver.try_recv() {
                 Ok(v) => {
