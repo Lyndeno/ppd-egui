@@ -7,4 +7,7 @@ edition = "2024"
 async-channel = "2.3.1"
 eframe = "0.31.1"
 env_logger = "0.11.8"
+futures = "0.3.31"
+ppd = {version = "0.1.4", default-features = false, features = [ "tokio", "blocking-api" ]}
 tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
+zbus = { version = "5.7.1", default-features = false, features = ["tokio", "blocking-api"] }

@@ -1,5 +1,7 @@
 use async_channel::TryRecvError;
 use eframe::egui;
+use futures::StreamExt;
+use ppd::{PpdProxy, PpdProxyBlocking};
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
@@ -8,22 +10,68 @@ pub fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("Tokio runtime needs to work"))
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Profile {
     PowerSaver,
     Balanced,
     Performance,
+    Other,
+}
+
+impl From<String> for Profile {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "power-saver" => Self::PowerSaver,
+            "balanced" => Self::Balanced,
+            "performance" => Self::Performance,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Other => "other",
+            Self::Balanced => "balanced",
+            Self::Performance => "performance",
+            Self::PowerSaver => "power-saver",
+        };
+        write!(f, "{s}")
+    }
 }
 
 fn main() -> eframe::Result {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
-    let (ui_sender, ui_receiver) = async_channel::unbounded();
+    let conn = zbus::blocking::Connection::system().unwrap();
+    let proxy = PpdProxyBlocking::new(&conn).unwrap();
+
+    let profiles: Vec<Profile> = proxy
+        .profiles()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.profile.into())
+        .collect();
+
+    let (ui_sender, ui_receiver) = async_channel::unbounded::<Profile>();
     let (task_sender, task_receiver) = async_channel::unbounded();
 
     let background = crate::runtime().spawn(async move {
+        let conn = zbus::Connection::system().await.unwrap();
+        let proxy = PpdProxy::new(&conn).await.unwrap();
         while let Ok(v) = ui_receiver.recv().await {
-            task_sender.send(v).await.unwrap();
+            proxy.set_active_profile(v.to_string()).await.unwrap()
+        }
+    });
+
+    let background_2 = crate::runtime().spawn(async move {
+        let conn = zbus::Connection::system().await.unwrap();
+        let proxy = PpdProxy::new(&conn).await.unwrap();
+        let mut signal = proxy.receive_active_profile_changed().await;
+        while let Some(p) = signal.next().await {
+            let profile: Profile = p.get().await.unwrap().into();
+            task_sender.send(profile).await.unwrap();
         }
     });
 
@@ -35,7 +83,7 @@ fn main() -> eframe::Result {
     };
 
     // Our application state:
-    let mut current = Profile::Balanced;
+    let mut current = proxy.active_profile().unwrap().into();
 
     eframe::run_simple_native("My egui App", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -50,38 +98,13 @@ fn main() -> eframe::Result {
                 Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
             }
 
-            if ui
-                .add(egui::RadioButton::new(
-                    current == Profile::Balanced,
-                    "Balanced",
-                ))
-                .clicked()
-            {
-                ui_sender
-                    .try_send(Profile::Balanced)
-                    .expect("Channel should work");
-            }
-            if ui
-                .add(egui::RadioButton::new(
-                    current == Profile::PowerSaver,
-                    "Power Saver",
-                ))
-                .clicked()
-            {
-                ui_sender
-                    .try_send(Profile::PowerSaver)
-                    .expect("Channel should work");
-            }
-            if ui
-                .add(egui::RadioButton::new(
-                    current == Profile::Performance,
-                    "Performance",
-                ))
-                .clicked()
-            {
-                ui_sender
-                    .try_send(Profile::Performance)
-                    .expect("Channel should work");
+            for p in &profiles {
+                if ui
+                    .add(egui::RadioButton::new(current == *p, p.to_string()))
+                    .clicked()
+                {
+                    ui_sender.try_send(*p).expect("Channel should work");
+                }
             }
         });
     })
