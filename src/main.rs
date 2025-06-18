@@ -2,8 +2,12 @@ use async_channel::TryRecvError;
 use eframe::egui::{self, Context};
 use futures::StreamExt;
 use ppd::{PpdProxy, PpdProxyBlocking};
-use std::sync::OnceLock;
+use std::{ops::Not, sync::OnceLock};
 use tokio::runtime::Runtime;
+
+use crate::toggle_switch::toggle_ui;
+
+mod toggle_switch;
 
 pub fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -59,11 +63,18 @@ fn main() -> eframe::Result {
     let (ui_sender, ui_receiver) = async_channel::unbounded::<Profile>();
     let (task_sender, task_receiver) = async_channel::unbounded();
     let (repaint_sender, repaint_receiver) = async_channel::unbounded();
+    let (battery_aware_task_sender, battery_aware_task_receiver) = async_channel::unbounded();
+    let (battery_aware_ui_sender, battery_aware_ui_receiver) = async_channel::unbounded();
 
     let _task_setup = crate::runtime().spawn(async move {
+        let rp: Context = repaint_receiver.recv().await.unwrap();
+        repaint_receiver.close();
+        let rp_ba = rp.clone();
         let conn = zbus::Connection::system().await.unwrap();
         let setter_proxy = PpdProxy::new(&conn).await.unwrap();
+        let ba_setter_proxy = PpdProxy::new(&conn).await.unwrap();
         let signal_proxy = setter_proxy.clone();
+        let ba_signal_proxy = setter_proxy.clone();
 
         let _setter_task = crate::runtime().spawn(async move {
             while let Ok(v) = ui_receiver.recv().await {
@@ -74,14 +85,27 @@ fn main() -> eframe::Result {
             }
         });
 
+        let _battery_aware_setter_task = crate::runtime().spawn(async move {
+            while let Ok(v) = battery_aware_ui_receiver.recv().await {
+                ba_setter_proxy.set_battery_aware(v).await.unwrap()
+            }
+        });
+
         let _signal_task = crate::runtime().spawn(async move {
-            let rp: Context = repaint_receiver.recv().await.unwrap();
-            repaint_receiver.close();
             let mut signal = signal_proxy.receive_active_profile_changed().await;
             while let Some(p) = signal.next().await {
                 let profile: Profile = p.get().await.unwrap().into();
                 task_sender.send(profile).await.unwrap();
                 rp.request_repaint();
+            }
+        });
+
+        let _battery_aware_task = crate::runtime().spawn(async move {
+            let mut signal = ba_signal_proxy.receive_battery_aware_changed().await;
+            while let Some(p) = signal.next().await {
+                let ba = p.get().await.unwrap();
+                battery_aware_task_sender.send(ba).await.unwrap();
+                rp_ba.request_repaint();
             }
         });
     });
@@ -95,6 +119,7 @@ fn main() -> eframe::Result {
 
     // Our application state:
     let mut current = proxy.active_profile().unwrap().into();
+    let mut mybool = proxy.battery_aware().unwrap();
 
     eframe::run_simple_native("ppd-egui", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -113,6 +138,14 @@ fn main() -> eframe::Result {
                 Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
             }
 
+            match battery_aware_task_receiver.try_recv() {
+                Ok(v) => {
+                    mybool = v;
+                }
+                Err(TryRecvError::Empty) => (),
+                Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
+            }
+
             for p in &profiles {
                 if ui
                     .add(egui::RadioButton::new(current == *p, p.to_string()))
@@ -121,6 +154,9 @@ fn main() -> eframe::Result {
                     ui_sender.try_send(*p).expect("Channel should work");
                 }
             }
+
+            ui.label("Battery Aware");
+            toggle_ui(ui, &mut mybool);
         });
     })
 }
