@@ -138,14 +138,6 @@ fn main() -> eframe::Result {
                 Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
             }
 
-            match battery_aware_task_receiver.try_recv() {
-                Ok(v) => {
-                    mybool = v;
-                }
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
-            }
-
             for p in &profiles {
                 if ui
                     .add(egui::RadioButton::new(current == *p, p.to_string()))
@@ -156,10 +148,20 @@ fn main() -> eframe::Result {
             }
 
             ui.label("Battery Aware");
-            if ui.add(ToggleSwitch::new(mybool)).clicked() {
+            let mut rp = ui.add(ToggleSwitch::new(mybool));
+            if rp.clicked() {
                 battery_aware_ui_sender
                     .try_send(!mybool)
                     .expect("Channel should work");
+            }
+
+            match battery_aware_task_receiver.try_recv() {
+                Ok(v) => {
+                    mybool = v;
+                    rp.mark_changed();
+                }
+                Err(TryRecvError::Empty) => (),
+                Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
             }
         });
     })
