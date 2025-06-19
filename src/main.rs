@@ -2,10 +2,10 @@ use async_channel::TryRecvError;
 use eframe::egui::{self, Context};
 use futures::StreamExt;
 use ppd::{PpdProxy, PpdProxyBlocking};
-use std::{ops::Not, sync::OnceLock};
+use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
-use crate::toggle_switch::toggle_ui;
+use crate::toggle_switch::ToggleSwitch;
 
 mod toggle_switch;
 
@@ -156,7 +156,11 @@ fn main() -> eframe::Result {
             }
 
             ui.label("Battery Aware");
-            toggle_ui(ui, &mut mybool);
+            if ui.add(ToggleSwitch::new(mybool)).clicked() {
+                battery_aware_ui_sender
+                    .try_send(!mybool)
+                    .expect("Channel should work");
+            }
         });
     })
 }
