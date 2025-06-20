@@ -1,4 +1,3 @@
-use async_channel::TryRecvError;
 use eframe::egui::{self, Context};
 use futures::StreamExt;
 use ppd::{PpdProxy, PpdProxyBlocking};
@@ -20,6 +19,13 @@ enum Profile {
     Balanced,
     Performance,
     Other,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum PpdValue {
+    Profile(Profile),
+    Context(Context),
+    BatteryAware(bool),
 }
 
 impl From<String> for Profile {
@@ -60,52 +66,63 @@ fn main() -> eframe::Result {
 
     let _ = conn.close();
 
-    let (ui_sender, ui_receiver) = async_channel::unbounded::<Profile>();
+    let (ui_sender, ui_receiver) = async_channel::unbounded();
     let (task_sender, task_receiver) = async_channel::unbounded();
-    let (repaint_sender, repaint_receiver) = async_channel::unbounded();
-    let (battery_aware_task_sender, battery_aware_task_receiver) = async_channel::unbounded();
-    let (battery_aware_ui_sender, battery_aware_ui_receiver) = async_channel::unbounded();
+    //let (battery_aware_task_sender, battery_aware_task_receiver) = async_channel::unbounded();
+    //let (battery_aware_ui_sender, battery_aware_ui_receiver) = async_channel::unbounded();
 
     let _task_setup = crate::runtime().spawn(async move {
-        let rp: Context = repaint_receiver.recv().await.unwrap();
-        repaint_receiver.close();
+        let rp = if let Ok(PpdValue::Context(c)) = ui_receiver.recv().await {
+            Some(c)
+        } else {
+            None
+        };
         let rp_ba = rp.clone();
         let conn = zbus::Connection::system().await.unwrap();
         let setter_proxy = PpdProxy::new(&conn).await.unwrap();
-        let ba_setter_proxy = PpdProxy::new(&conn).await.unwrap();
-        let signal_proxy = setter_proxy.clone();
-        let ba_signal_proxy = setter_proxy.clone();
+        let profile_signal_proxy = setter_proxy.clone();
+        let ba_signal_proxy = profile_signal_proxy.clone();
 
         let _setter_task = crate::runtime().spawn(async move {
             while let Ok(v) = ui_receiver.recv().await {
-                setter_proxy
-                    .set_active_profile(v.to_string())
-                    .await
-                    .unwrap()
+                match v {
+                    PpdValue::Profile(p) => setter_proxy
+                        .set_active_profile(p.to_string())
+                        .await
+                        .unwrap(),
+                    PpdValue::Context(_) => todo!(),
+                    PpdValue::BatteryAware(ba) => setter_proxy.set_battery_aware(ba).await.unwrap(),
+                }
             }
         });
 
-        let _battery_aware_setter_task = crate::runtime().spawn(async move {
-            while let Ok(v) = battery_aware_ui_receiver.recv().await {
-                ba_setter_proxy.set_battery_aware(v).await.unwrap()
-            }
-        });
-
+        let signal_sender = task_sender.clone();
         let _signal_task = crate::runtime().spawn(async move {
-            let mut signal = signal_proxy.receive_active_profile_changed().await;
+            let mut signal = profile_signal_proxy.receive_active_profile_changed().await;
             while let Some(p) = signal.next().await {
                 let profile: Profile = p.get().await.unwrap().into();
-                task_sender.send(profile).await.unwrap();
-                rp.request_repaint();
+                signal_sender
+                    .send(PpdValue::Profile(profile))
+                    .await
+                    .unwrap();
+                if let Some(c) = &rp {
+                    c.request_repaint();
+                };
             }
         });
 
+        let battery_aware_sender = task_sender.clone();
         let _battery_aware_task = crate::runtime().spawn(async move {
             let mut signal = ba_signal_proxy.receive_battery_aware_changed().await;
             while let Some(p) = signal.next().await {
                 let ba = p.get().await.unwrap();
-                battery_aware_task_sender.send(ba).await.unwrap();
-                rp_ba.request_repaint();
+                battery_aware_sender
+                    .send(PpdValue::BatteryAware(ba))
+                    .await
+                    .unwrap();
+                if let Some(c) = &rp_ba {
+                    c.request_repaint();
+                };
             }
         });
     });
@@ -120,22 +137,15 @@ fn main() -> eframe::Result {
     // Our application state:
     let mut current = proxy.active_profile().unwrap().into();
     let mut mybool = proxy.battery_aware().unwrap();
+    let mut context_sent = false;
 
     eframe::run_simple_native("ppd-egui", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("System Power");
             ui.label("Power Profiles");
 
-            if !repaint_sender.is_closed() {
-                let _ = repaint_sender.try_send(ctx.clone());
-            }
-
-            match task_receiver.try_recv() {
-                Ok(v) => {
-                    current = v;
-                }
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
+            if !context_sent {
+                context_sent = ui_sender.try_send(PpdValue::Context(ctx.clone())).is_ok();
             }
 
             for p in &profiles {
@@ -143,25 +153,31 @@ fn main() -> eframe::Result {
                     .add(egui::RadioButton::new(current == *p, p.to_string()))
                     .clicked()
                 {
-                    ui_sender.try_send(*p).expect("Channel should work");
+                    ui_sender
+                        .try_send(PpdValue::Profile(*p))
+                        .expect("Channel should work");
                 }
             }
 
             ui.label("Battery Aware");
             let mut rp = ui.add(ToggleSwitch::new(mybool));
             if rp.clicked() {
-                battery_aware_ui_sender
-                    .try_send(!mybool)
+                ui_sender
+                    .try_send(PpdValue::BatteryAware(!mybool))
                     .expect("Channel should work");
             }
 
-            match battery_aware_task_receiver.try_recv() {
-                Ok(v) => {
-                    mybool = v;
-                    rp.mark_changed();
+            while let Ok(v) = task_receiver.try_recv() {
+                match v {
+                    PpdValue::Profile(p) => {
+                        current = p;
+                    }
+                    PpdValue::BatteryAware(ba) => {
+                        mybool = ba;
+                        rp.mark_changed();
+                    }
+                    PpdValue::Context(_) => {}
                 }
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Closed) => panic!("Channel should not be closed"),
             }
         });
     })
