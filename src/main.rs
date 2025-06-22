@@ -3,11 +3,20 @@ use eframe::egui::{self, Context};
 use futures::StreamExt;
 use ppd::{PpdProxy, PpdProxyBlocking};
 use std::sync::OnceLock;
+use thiserror::Error as ThisError;
 use tokio::runtime::Runtime;
 
 use crate::toggle_switch::ToggleSwitch;
 
 mod toggle_switch;
+
+#[derive(ThisError, Debug)]
+enum Error {
+    #[error("Error communicating with dbus")]
+    ZBusError(#[from] zbus::Error),
+    #[error("Error producing user interface")]
+    EFrameError(#[from] eframe::Error),
+}
 
 /// Create or return existing tokio runtime
 ///
@@ -57,82 +66,84 @@ impl std::fmt::Display for Profile {
     }
 }
 
-fn task_setup(sender: Sender<PpdValue>, receiver: Receiver<PpdValue>) {
-    let _task_setup = crate::runtime().spawn(async move {
-        let rp = if let Ok(PpdValue::Context(c)) = receiver.recv().await {
-            Some(c)
-        } else {
-            None
-        };
-        let rp_ba = rp.clone();
-        let conn = zbus::Connection::system().await.unwrap();
-        let setter_proxy = PpdProxy::new(&conn).await.unwrap();
-        let profile_signal_proxy = setter_proxy.clone();
-        let ba_signal_proxy = profile_signal_proxy.clone();
+async fn task_setup(sender: Sender<PpdValue>, receiver: Receiver<PpdValue>) {
+    let rp = if let Ok(PpdValue::Context(c)) = receiver.recv().await {
+        Some(c)
+    } else {
+        None
+    };
+    let rp_ba = rp.clone();
+    let conn = zbus::Connection::system().await.unwrap();
+    let setter_proxy = PpdProxy::new(&conn).await.unwrap();
+    let profile_signal_proxy = setter_proxy.clone();
+    let ba_signal_proxy = profile_signal_proxy.clone();
 
-        let _setter_task = crate::runtime().spawn(async move {
-            while let Ok(v) = receiver.recv().await {
-                match v {
-                    PpdValue::Profile(p) => setter_proxy
-                        .set_active_profile(p.to_string())
-                        .await
-                        .unwrap(),
-                    PpdValue::Context(_) => todo!(),
-                    PpdValue::BatteryAware(ba) => setter_proxy.set_battery_aware(ba).await.unwrap(),
-                }
-            }
-        });
-
-        let signal_sender = sender.clone();
-        let _signal_task = crate::runtime().spawn(async move {
-            let mut signal = profile_signal_proxy.receive_active_profile_changed().await;
-            while let Some(p) = signal.next().await {
-                let profile: Profile = p.get().await.unwrap().into();
-                signal_sender
-                    .send(PpdValue::Profile(profile))
+    let _setter_task = crate::runtime().spawn(async move {
+        while let Ok(v) = receiver.recv().await {
+            match v {
+                PpdValue::Profile(p) => setter_proxy
+                    .set_active_profile(p.to_string())
                     .await
-                    .unwrap();
-                if let Some(c) = &rp {
-                    c.request_repaint();
-                };
+                    .unwrap(),
+                PpdValue::Context(_) => todo!(),
+                PpdValue::BatteryAware(ba) => setter_proxy.set_battery_aware(ba).await.unwrap(),
             }
-        });
+        }
+    });
 
-        let battery_aware_sender = sender.clone();
-        let _battery_aware_task = crate::runtime().spawn(async move {
-            let mut signal = ba_signal_proxy.receive_battery_aware_changed().await;
-            while let Some(p) = signal.next().await {
-                let ba = p.get().await.unwrap();
-                battery_aware_sender
-                    .send(PpdValue::BatteryAware(ba))
-                    .await
-                    .unwrap();
-                if let Some(c) = &rp_ba {
-                    c.request_repaint();
-                };
-            }
-        });
+    let signal_sender = sender.clone();
+    let _signal_task = crate::runtime().spawn(async move {
+        let mut signal = profile_signal_proxy.receive_active_profile_changed().await;
+        while let Some(p) = signal.next().await {
+            let profile: Profile = p.get().await.unwrap().into();
+            signal_sender
+                .send(PpdValue::Profile(profile))
+                .await
+                .unwrap();
+            if let Some(c) = &rp {
+                c.request_repaint();
+            };
+        }
+    });
+
+    let battery_aware_sender = sender.clone();
+    let _battery_aware_task = crate::runtime().spawn(async move {
+        let mut signal = ba_signal_proxy.receive_battery_aware_changed().await;
+        while let Some(p) = signal.next().await {
+            let ba = p.get().await.unwrap();
+            battery_aware_sender
+                .send(PpdValue::BatteryAware(ba))
+                .await
+                .unwrap();
+            if let Some(c) = &rp_ba {
+                c.request_repaint();
+            };
+        }
     });
 }
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Error> {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
-    let conn = zbus::blocking::Connection::system().unwrap();
-    let proxy = PpdProxyBlocking::new(&conn).unwrap();
+    let conn = zbus::blocking::Connection::system()?;
+    let proxy = PpdProxyBlocking::new(&conn)?;
 
     let profiles: Vec<Profile> = proxy
-        .profiles()
-        .unwrap()
+        .profiles()?
         .into_iter()
         .map(|p| p.profile.into())
         .collect();
+
+    // Our application state:
+    let mut current = proxy.active_profile()?.into();
+    let mut mybool = proxy.battery_aware()?;
+    let mut context_sent = false;
 
     let _ = conn.close();
 
     let (ui_sender, ui_receiver) = async_channel::unbounded();
     let (task_sender, task_receiver) = async_channel::unbounded();
-    task_setup(task_sender, ui_receiver);
+    crate::runtime().spawn(task_setup(task_sender, ui_receiver));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -141,12 +152,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    // Our application state:
-    let mut current = proxy.active_profile().unwrap().into();
-    let mut mybool = proxy.battery_aware().unwrap();
-    let mut context_sent = false;
-
-    eframe::run_simple_native("ppd-egui", options, move |ctx, _frame| {
+    let result = eframe::run_simple_native("ppd-egui", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("System Power");
             ui.label("Power Profiles");
@@ -187,5 +193,10 @@ fn main() -> eframe::Result {
                 }
             }
         });
-    })
+    });
+    if let Err(e) = result {
+        Err(e.into())
+    } else {
+        Ok(())
+    }
 }
