@@ -5,6 +5,7 @@ use ppd::{PpdProxy, PpdProxyBlocking};
 use std::sync::OnceLock;
 use thiserror::Error as ThisError;
 use tokio::runtime::Runtime;
+use tokio::select;
 
 use crate::toggle_switch::ToggleSwitch;
 
@@ -73,53 +74,73 @@ async fn task_setup(sender: Sender<PpdValue>, receiver: Receiver<PpdValue>) {
         None
     };
     let rp_ba = rp.clone();
-    let conn = zbus::Connection::system().await.unwrap();
-    let setter_proxy = PpdProxy::new(&conn).await.unwrap();
-    let profile_signal_proxy = setter_proxy.clone();
-    let ba_signal_proxy = profile_signal_proxy.clone();
 
-    let _setter_task = crate::runtime().spawn(async move {
-        while let Ok(v) = receiver.recv().await {
-            match v {
-                PpdValue::Profile(p) => setter_proxy
-                    .set_active_profile(p.to_string())
-                    .await
-                    .unwrap(),
-                PpdValue::Context(_) => todo!(),
-                PpdValue::BatteryAware(ba) => setter_proxy.set_battery_aware(ba).await.unwrap(),
-            }
-        }
-    });
+    if let Ok(conn) = zbus::Connection::system().await {
+        if let Ok(setter_proxy) = PpdProxy::new(&conn).await {
+            let profile_signal_proxy = setter_proxy.clone();
+            let ba_signal_proxy = profile_signal_proxy.clone();
 
-    let signal_sender = sender.clone();
-    let _signal_task = crate::runtime().spawn(async move {
-        let mut signal = profile_signal_proxy.receive_active_profile_changed().await;
-        while let Some(p) = signal.next().await {
-            let profile: Profile = p.get().await.unwrap().into();
-            signal_sender
-                .send(PpdValue::Profile(profile))
-                .await
-                .unwrap();
-            if let Some(c) = &rp {
-                c.request_repaint();
+            let setter_task = crate::runtime().spawn(async move {
+                while let Ok(v) = receiver.recv().await {
+                    let result = match v {
+                        PpdValue::Profile(p) => {
+                            setter_proxy.set_active_profile(p.to_string()).await
+                        }
+                        PpdValue::BatteryAware(ba) => setter_proxy.set_battery_aware(ba).await,
+                        PpdValue::Context(_) => Ok(()),
+                    };
+
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let signal_sender = sender.clone();
+            let signal_task = crate::runtime().spawn(async move {
+                let mut signal = profile_signal_proxy.receive_active_profile_changed().await;
+                while let Some(p) = signal.next().await {
+                    if let Ok(profile) = p.get().await {
+                        if let Ok(()) = signal_sender.send(PpdValue::Profile(profile.into())).await
+                        {
+                            if let Some(c) = &rp {
+                                c.request_repaint();
+                            }
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+
+            let battery_aware_sender = sender.clone();
+            let battery_aware_task = crate::runtime().spawn(async move {
+                let mut signal = ba_signal_proxy.receive_battery_aware_changed().await;
+                while let Some(p) = signal.next().await {
+                    if let Ok(ba) = p.get().await {
+                        if let Ok(()) = battery_aware_sender.send(PpdValue::BatteryAware(ba)).await
+                        {
+                            if let Some(c) = &rp_ba {
+                                c.request_repaint();
+                            }
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+
+            select! {
+                _ = setter_task => {},
+                _ = signal_task => {},
+                _ = battery_aware_task => {},
             };
         }
-    });
-
-    let battery_aware_sender = sender.clone();
-    let _battery_aware_task = crate::runtime().spawn(async move {
-        let mut signal = ba_signal_proxy.receive_battery_aware_changed().await;
-        while let Some(p) = signal.next().await {
-            let ba = p.get().await.unwrap();
-            battery_aware_sender
-                .send(PpdValue::BatteryAware(ba))
-                .await
-                .unwrap();
-            if let Some(c) = &rp_ba {
-                c.request_repaint();
-            };
-        }
-    });
+    }
 }
 
 fn main() -> Result<(), Error> {
