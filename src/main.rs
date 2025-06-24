@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use thiserror::Error as ThisError;
 use tokio::runtime::Runtime;
 use tokio::select;
+use tokio_util::sync::CancellationToken;
 
 use crate::toggle_switch::ToggleSwitch;
 
@@ -67,7 +68,11 @@ impl std::fmt::Display for Profile {
     }
 }
 
-async fn task_setup(sender: Sender<PpdValue>, receiver: Receiver<PpdValue>) {
+async fn task_setup(
+    sender: Sender<PpdValue>,
+    receiver: Receiver<PpdValue>,
+    cancellation_token: CancellationToken,
+) {
     let rp = if let Ok(PpdValue::Context(c)) = receiver.recv().await {
         Some(c)
     } else {
@@ -135,6 +140,7 @@ async fn task_setup(sender: Sender<PpdValue>, receiver: Receiver<PpdValue>) {
             });
 
             select! {
+                () = cancellation_token.cancelled() => {},
                 _ = setter_task => {},
                 _ = signal_task => {},
                 _ = battery_aware_task => {},
@@ -164,7 +170,9 @@ fn main() -> Result<(), Error> {
 
     let (ui_sender, ui_receiver) = async_channel::unbounded();
     let (task_sender, task_receiver) = async_channel::unbounded();
-    crate::runtime().spawn(task_setup(task_sender, ui_receiver));
+
+    let token = CancellationToken::new();
+    let tasks = crate::runtime().spawn(task_setup(task_sender, ui_receiver, token.clone()));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -215,6 +223,13 @@ fn main() -> Result<(), Error> {
             }
         });
     });
+
+    // The other tasks will trigger cancellation when the channels drop.
+    // But we manually cancel in case in the future that is not the case.
+    token.cancel();
+    // Wait for tasks to end
+    let _ = runtime().block_on(tasks);
+
     if let Err(e) = result {
         Err(e.into())
     } else {

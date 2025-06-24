@@ -11,6 +11,7 @@ futures = "0.3.31"
 ppd = {version = "0.1.4", default-features = false, features = [ "tokio", "blocking-api" ]}
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros"] }
+tokio-util = {version = "0.7.15", features = ["rt"]}
 zbus = { version = "5.7.1", default-features = false, features = ["tokio", "blocking-api"] }
 
 [lints.clippy]
